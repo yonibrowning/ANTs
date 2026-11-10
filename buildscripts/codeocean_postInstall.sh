@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Code Ocean environment "postInstall" script: build this ANTs fork into /opt/ants.
+# Code Ocean environment "postInstall" script: build this ANTs fork into /opt/ants and make it
+# the ANTs that commandants (and anything else using PATH) runs.
 #
 # It runs once when the capsule environment is built, so the compiled tools are part of the
 # image rather than rebuilt on every run. Paste it into the capsule's postInstall (Environment
@@ -48,5 +49,38 @@ cmake --install "$WORK/build/ANTS-build"
 git -C "$WORK/src" rev-parse HEAD > "$PREFIX/ANTS_COMMIT"
 rm -rf "$WORK"
 
-echo "ANTs installed in $PREFIX/bin (commit $(cat $PREFIX/ANTS_COMMIT))."
-echo "Add it to PATH, or point commandants at it: ants_path=\"$PREFIX/bin\" / ANTSPATH=$PREFIX/bin"
+# Make this build the one everything finds, commandants included. commandants searches
+# ants_path= -> $ANTSPATH -> PATH -> its own downloaded copy. Capsule runs start from a
+# non-interactive shell that never reads profile files, so an exported ANTSPATH would not
+# reach them; links in /usr/local/bin (on PATH for every process) do. ANTSPATH is still set
+# for terminal sessions.
+for f in "$PREFIX"/bin/*; do
+  ln -sf "$f" /usr/local/bin/
+done
+echo "export ANTSPATH=$PREFIX/bin" > /etc/profile.d/ants.sh
+
+# Fail the environment build if anything would pick up a different ANTs.
+found="$(command -v antsRegistration || true)"
+if [ "$(readlink -f "$found")" != "$PREFIX/bin/antsRegistration" ]; then
+  echo "ERROR: antsRegistration on PATH is '$found', not $PREFIX/bin. Another ANTs comes" >&2
+  echo "earlier on PATH ($PATH); remove it or set ANTSPATH=$PREFIX/bin for the capsule." >&2
+  exit 1
+fi
+# Run from / so a folder that happens to be called "commandants" isn't imported instead.
+cd /
+if command -v python3 >/dev/null 2>&1 && python3 -c "import commandants.core.executable" 2>/dev/null; then
+  python3 - "$PREFIX/bin" <<'EOF'
+import os, sys
+from commandants.core.executable import resolve_binary
+want = os.path.realpath(os.path.join(sys.argv[1], "antsRegistration"))
+got = os.path.realpath(resolve_binary("antsRegistration"))
+if got != want:
+    sys.exit("ERROR: commandants resolves antsRegistration to %s, not %s" % (got, want))
+print("commandants uses", got)
+EOF
+else
+  echo "commandants is not installed in this environment yet; once it is, it will find" \
+       "this build on PATH (/usr/local/bin -> $PREFIX/bin)."
+fi
+
+echo "ANTs installed in $PREFIX/bin (commit $(cat $PREFIX/ANTS_COMMIT)), linked into /usr/local/bin."
