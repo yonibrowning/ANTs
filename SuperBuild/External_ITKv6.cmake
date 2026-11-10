@@ -163,9 +163,23 @@ if(NOT DEFINED ${extProjName}_DIR AND NOT ${USE_SYSTEM_${extProjName}})
   set(${proj}_GIT_TAG 18d89fd6538769ac83d8e21ba0e10593c6c68751) # 2026-03-18
   set(ITK_VERSION_ID ITK-6.0) ### NOTE: When updating GIT_TAG, also update ITK_VERSION_ID if ITK version has changed
 
+  # Performance patches for the SyN registration loop and the CC metric (see patches/itk/README.md).
+  # They are written against the GIT_TAG above; update or drop them if the tag changes.
+  option(ANTS_ITK_PERFORMANCE_PATCHES "Apply patches/itk/*.patch to the ITK source (faster SyN/CC)" ON)
+  set(${proj}_PATCH_COMMAND)
+  if(ANTS_ITK_PERFORMANCE_PATCHES)
+    set(${proj}_PATCH_COMMAND PATCH_COMMAND
+      ${CMAKE_COMMAND}
+        -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+        -DSOURCE_DIR=<SOURCE_DIR>
+        -DPATCH_DIR=${CMAKE_SOURCE_DIR}/patches/itk
+        -P ${CMAKE_SOURCE_DIR}/SuperBuild/ApplyPatches.cmake)
+  endif()
+
   ExternalProject_Add(${proj}
     GIT_REPOSITORY ${${proj}_REPOSITORY}
     GIT_TAG ${${proj}_GIT_TAG}
+    ${${proj}_PATCH_COMMAND}
     SOURCE_DIR ${proj}
     BINARY_DIR ${proj}-build
     LOG_CONFIGURE 0  # Wrap configure in script to ignore log output from dashboards

@@ -1,0 +1,796 @@
+diff --git a/Modules/Registration/RegistrationMethodsv4/include/itkSyNImageRegistrationMethod.h b/Modules/Registration/RegistrationMethodsv4/include/itkSyNImageRegistrationMethod.h
+--- a/Modules/Registration/RegistrationMethodsv4/include/itkSyNImageRegistrationMethod.h
++++ b/Modules/Registration/RegistrationMethodsv4/include/itkSyNImageRegistrationMethod.h
+@@ -256,9 +256,32 @@
+   bool                        m_DownsampleImagesForMetricDerivatives{ true };
+   bool                        m_AverageMidPointGradients{ false };
+ 
++  /** Each SyN iteration evaluates the metric twice with the roles of the two images swapped,
++   * so with DownsampleImagesForMetricDerivatives it resamples the same (image, transform)
++   * pairs twice. These caches let the second evaluation reuse the first one's results. They
++   * are only valid within one iteration and are cleared at the start and end of each. */
++  void
++  ClearResampleCache();
++
+ private:
+   RealType m_GaussianSmoothingVarianceForTheUpdateField{ 3.0 };
+   RealType m_GaussianSmoothingVarianceForTheTotalField{ 0.5 };
++
++  template <typename TResult>
++  struct ResampleCacheEntry
++  {
++    const void * source{ nullptr };
++    const void * transform{ nullptr };
++    TResult      result{};
++  };
++  std::vector<ResampleCacheEntry<typename FixedImageType::Pointer>>              m_ResampledImageCache{};
++  std::vector<ResampleCacheEntry<typename ImageMaskSpatialObjectType::Pointer>> m_ResampledMaskCache{};
++  /** Only SyN's own StartOptimization clears the caches per iteration, so only it turns them on
++   * (subclasses with their own loops, e.g. BSplineSyN, keep resampling every call). */
++  bool m_UseResampleCache{ false };
++
++  /** Zero displacement field transform on the current virtual domain, reused across metric calls. */
++  DisplacementFieldTransformPointer m_IdentityDisplacementFieldTransform{};
+ };
+ } // end namespace itk
+ 
+diff --git a/Modules/Registration/RegistrationMethodsv4/include/itkSyNImageRegistrationMethod.hxx b/Modules/Registration/RegistrationMethodsv4/include/itkSyNImageRegistrationMethod.hxx
+--- a/Modules/Registration/RegistrationMethodsv4/include/itkSyNImageRegistrationMethod.hxx
++++ b/Modules/Registration/RegistrationMethodsv4/include/itkSyNImageRegistrationMethod.hxx
+@@ -31,6 +31,17 @@
+ #include "itkVectorNeighborhoodOperatorImageFilter.h"
+ #include "itkWindowConvergenceMonitoringFunction.h"
+ 
++#include <algorithm>
++#include <mutex>
++#include <type_traits>
++#include <vector>
++
++#if defined(_MSC_VER)
++#  define ANTS_SYN_RESTRICT __restrict
++#else
++#  define ANTS_SYN_RESTRICT __restrict__
++#endif
++
+ namespace itk
+ {
+ 
+@@ -150,8 +161,10 @@
+ 
+   IterationReporter reporter(this, 0, 1);
+ 
++  this->m_UseResampleCache = true;
+   while (this->m_CurrentIteration++ < this->m_NumberOfIterationsPerLevel[this->m_CurrentLevel] && !this->m_IsConverged)
+   {
++    this->ClearResampleCache();
+     auto fixedComposite = CompositeTransformType::New();
+     if (fixedInitialTransform != nullptr)
+     {
+@@ -192,6 +205,7 @@
+                                this->m_MovingImageMasks,
+                                this->m_FixedImageMasks,
+                                fixedMetricValue);
++    this->ClearResampleCache();
+ 
+     if (this->m_AverageMidPointGradients)
+     {
+@@ -263,6 +277,20 @@
+     }
+     reporter.CompletedStep();
+   }
++  this->ClearResampleCache();
++  this->m_UseResampleCache = false;
++}
++
++template <typename TFixedImage,
++          typename TMovingImage,
++          typename TOutputTransform,
++          typename TVirtualImage,
++          typename TPointSet>
++void
++SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform, TVirtualImage, TPointSet>::ClearResampleCache()
++{
++  this->m_ResampledImageCache.clear();
++  this->m_ResampledMaskCache.clear();
+ }
+ 
+ template <typename TFixedImage,
+@@ -495,30 +523,96 @@
+       else
+       {
+         step_profiler::Scope resampleImagesStep("resample_images");
+-        using FixedResamplerType = ResampleImageFilter<FixedImageType, FixedImageType, RealType>;
+-        auto fixedResampler = FixedResamplerType::New();
+-        fixedResampler->SetInput(fixedImages[0]);
+-        fixedResampler->SetTransform(fixedTransform);
+-        fixedResampler->UseReferenceImageOn();
+-        fixedResampler->SetReferenceImage(virtualDomainImage);
+-        fixedResampler->SetDefaultPixelValue(0);
+-        fixedResampler->Update();
+-
+-        using MovingResamplerType = ResampleImageFilter<MovingImageType, MovingImageType, RealType>;
+-        auto movingResampler = MovingResamplerType::New();
+-        movingResampler->SetInput(movingImages[0]);
+-        movingResampler->SetTransform(movingTransform);
+-        movingResampler->UseReferenceImageOn();
+-        movingResampler->SetReferenceImage(virtualDomainImage);
+-        movingResampler->SetDefaultPixelValue(0);
+-        movingResampler->Update();
+-
+-        this->m_Metric->SetFixedObject(fixedResampler->GetOutput());
+-        this->m_Metric->SetMovingObject(movingResampler->GetOutput());
++        // The two metric evaluations of an iteration resample the same (image, transform)
++        // pairs with the roles swapped; reuse the first evaluation's results (same filter,
++        // interpolator, reference and default value, so the images are identical).
++        constexpr bool                   sameImageTypes = std::is_same_v<FixedImageType, MovingImageType>;
++        typename FixedImageType::Pointer resampledFixed;
++        if constexpr (sameImageTypes)
++        {
++          for (const auto & entry : this->m_ResampledImageCache)
++          {
++            if (entry.source == fixedImages[0].GetPointer() && entry.transform == fixedTransform)
++            {
++              resampledFixed = entry.result;
++            }
++          }
++        }
++        if (resampledFixed.IsNull())
++        {
++          using FixedResamplerType = ResampleImageFilter<FixedImageType, FixedImageType, RealType>;
++          auto fixedResampler = FixedResamplerType::New();
++          fixedResampler->SetInput(fixedImages[0]);
++          fixedResampler->SetTransform(fixedTransform);
++          fixedResampler->UseReferenceImageOn();
++          fixedResampler->SetReferenceImage(virtualDomainImage);
++          fixedResampler->SetDefaultPixelValue(0);
++          fixedResampler->Update();
++          resampledFixed = fixedResampler->GetOutput();
++          resampledFixed->DisconnectPipeline();
++          if constexpr (sameImageTypes)
++          {
++            if (this->m_UseResampleCache)
++            {
++              this->m_ResampledImageCache.push_back({ fixedImages[0].GetPointer(), fixedTransform, resampledFixed });
++            }
++          }
++        }
++
++        typename MovingImageType::Pointer resampledMoving;
++        if constexpr (sameImageTypes)
++        {
++          for (const auto & entry : this->m_ResampledImageCache)
++          {
++            if (entry.source == movingImages[0].GetPointer() && entry.transform == movingTransform)
++            {
++              resampledMoving = entry.result;
++            }
++          }
++        }
++        if (resampledMoving.IsNull())
++        {
++          using MovingResamplerType = ResampleImageFilter<MovingImageType, MovingImageType, RealType>;
++          auto movingResampler = MovingResamplerType::New();
++          movingResampler->SetInput(movingImages[0]);
++          movingResampler->SetTransform(movingTransform);
++          movingResampler->UseReferenceImageOn();
++          movingResampler->SetReferenceImage(virtualDomainImage);
++          movingResampler->SetDefaultPixelValue(0);
++          movingResampler->Update();
++          resampledMoving = movingResampler->GetOutput();
++          resampledMoving->DisconnectPipeline();
++          if constexpr (sameImageTypes)
++          {
++            if (this->m_UseResampleCache)
++            {
++              this->m_ResampledImageCache.push_back({ movingImages[0].GetPointer(), movingTransform, resampledMoving });
++            }
++          }
++        }
++
++        this->m_Metric->SetFixedObject(resampledFixed);
++        this->m_Metric->SetMovingObject(resampledMoving);
+         resampleImagesStep.Stop();
+         const step_profiler::Scope resampleMasksStep("resample_masks");
+ 
+-        if (fixedImageMasks[0])
++        const auto cachedMask = [this](const void * source, const void * transform) {
++          for (const auto & entry : this->m_ResampledMaskCache)
++          {
++            if (entry.source == source && entry.transform == transform)
++            {
++              return entry.result;
++            }
++          }
++          return typename ImageMaskSpatialObjectType::Pointer{};
++        };
++
++        if (fixedImageMasks[0] && cachedMask(fixedImageMasks[0].GetPointer(), fixedTransform))
++        {
++          dynamic_cast<ImageMetricType *>(this->m_Metric.GetPointer())
++            ->SetFixedImageMask(cachedMask(fixedImageMasks[0].GetPointer(), fixedTransform));
++        }
++        else if (fixedImageMasks[0])
+         {
+           using NearestNeighborInterpolatorType = NearestNeighborInterpolateImageFunction<FixedMaskImageType, RealType>;
+           auto nearestNeighborInterpolator = NearestNeighborInterpolatorType::New();
+@@ -541,11 +635,21 @@
+ 
+           auto resampledFixedImageMask = ImageMaskSpatialObjectType::New();
+           resampledFixedImageMask->SetImage(fixedMaskResampler->GetOutput());
++          if (this->m_UseResampleCache)
++          {
++            this->m_ResampledMaskCache.push_back(
++              { fixedImageMasks[0].GetPointer(), fixedTransform, resampledFixedImageMask });
++          }
+ 
+           dynamic_cast<ImageMetricType *>(this->m_Metric.GetPointer())->SetFixedImageMask(resampledFixedImageMask);
+         }
+ 
+-        if (movingImageMasks[0])
++        if (movingImageMasks[0] && cachedMask(movingImageMasks[0].GetPointer(), movingTransform))
++        {
++          dynamic_cast<ImageMetricType *>(this->m_Metric.GetPointer())
++            ->SetMovingImageMask(cachedMask(movingImageMasks[0].GetPointer(), movingTransform));
++        }
++        else if (movingImageMasks[0])
+         {
+           using NearestNeighborInterpolatorType =
+             NearestNeighborInterpolateImageFunction<MovingMaskImageType, RealType>;
+@@ -569,6 +673,11 @@
+ 
+           auto resampledMovingImageMask = ImageMaskSpatialObjectType::New();
+           resampledMovingImageMask->SetImage(movingMaskResampler->GetOutput());
++          if (this->m_UseResampleCache)
++          {
++            this->m_ResampledMaskCache.push_back(
++              { movingImageMasks[0].GetPointer(), movingTransform, resampledMovingImageMask });
++          }
+ 
+           dynamic_cast<ImageMetricType *>(this->m_Metric.GetPointer())->SetMovingImageMask(resampledMovingImageMask);
+         }
+@@ -584,14 +693,26 @@
+       this->m_Metric->GetMetricCategory() != ObjectToObjectMetricBaseTemplateEnums::MetricCategory::POINT_SET_METRIC)
+   {
+     const step_profiler::Scope identityFieldStep("identity_field");
+-    auto                       identityField = DisplacementFieldType::New();
+-    identityField->CopyInformation(virtualDomainImage);
+-    identityField->SetRegions(virtualDomainImage->GetLargestPossibleRegion());
+-    identityField->AllocateInitialized();
+-
+-    const DisplacementFieldTransformPointer identityDisplacementFieldTransform = DisplacementFieldTransformType::New();
+-    identityDisplacementFieldTransform->SetDisplacementField(identityField);
+-    identityDisplacementFieldTransform->SetInverseDisplacementField(identityField);
++    // Reuse the zero field while the virtual domain is unchanged (it changes per level).
++    const DisplacementFieldType * cachedField = this->m_IdentityDisplacementFieldTransform.IsNull()
++                                                  ? nullptr
++                                                  : this->m_IdentityDisplacementFieldTransform->GetDisplacementField();
++    if (cachedField == nullptr || cachedField->GetOrigin() != virtualDomainImage->GetOrigin() ||
++        cachedField->GetSpacing() != virtualDomainImage->GetSpacing() ||
++        cachedField->GetDirection() != virtualDomainImage->GetDirection() ||
++        cachedField->GetLargestPossibleRegion() != virtualDomainImage->GetLargestPossibleRegion())
++    {
++      auto identityField = DisplacementFieldType::New();
++      identityField->CopyInformation(virtualDomainImage);
++      identityField->SetRegions(virtualDomainImage->GetLargestPossibleRegion());
++      identityField->AllocateInitialized();
++
++      this->m_IdentityDisplacementFieldTransform = DisplacementFieldTransformType::New();
++      this->m_IdentityDisplacementFieldTransform->SetDisplacementField(identityField);
++      this->m_IdentityDisplacementFieldTransform->SetInverseDisplacementField(identityField);
++    }
++    const DisplacementFieldTransformPointer identityDisplacementFieldTransform =
++      this->m_IdentityDisplacementFieldTransform;
+ 
+     if (this->m_Metric->GetMetricCategory() == ObjectToObjectMetricBaseTemplateEnums::MetricCategory::MULTI_METRIC)
+     {
+@@ -613,11 +734,36 @@
+ 
+   step_profiler::Scope derivativeAllocStep("derivative_alloc");
+   using MetricDerivativeType = typename ImageMetricType::DerivativeType;
++  using MetricDerivativeValueType = typename MetricDerivativeType::ValueType;
+   const typename MetricDerivativeType::SizeValueType metricDerivativeSize =
+     virtualDomainImage->GetLargestPossibleRegion().GetNumberOfPixels() * ImageDimension;
+-  MetricDerivativeType metricDerivative(metricDerivativeSize);
+-
+-  metricDerivative.Fill(typename MetricDerivativeType::ValueType{});
++
++  auto gradientField = DisplacementFieldType::New();
++  gradientField->CopyInformation(virtualDomainImage);
++  gradientField->SetRegions(virtualDomainImage->GetRequestedRegion());
++  gradientField->Allocate();
++
++  // The metric stores one ImageDimension-vector per virtual voxel in buffer order, which is
++  // exactly the gradient field's memory layout, so let it write into the field directly
++  // instead of into a separate array that is then copied over.
++  constexpr bool sameLayout =
++    std::is_same_v<MetricDerivativeValueType, typename DisplacementVectorType::ValueType> &&
++    sizeof(DisplacementVectorType) == ImageDimension * sizeof(MetricDerivativeValueType);
++  const bool writeInPlace =
++    sameLayout && virtualDomainImage->GetRequestedRegion() == virtualDomainImage->GetLargestPossibleRegion();
++  auto * const gradientBuffer = reinterpret_cast<MetricDerivativeValueType *>(gradientField->GetBufferPointer());
++
++  MetricDerivativeType metricDerivative;
++  if (writeInPlace)
++  {
++    metricDerivative.SetData(gradientBuffer, metricDerivativeSize, false);
++  }
++  else
++  {
++    metricDerivative.SetSize(metricDerivativeSize);
++  }
++
++  metricDerivative.Fill(MetricDerivativeValueType{});
+   derivativeAllocStep.Stop();
+ 
+   step_profiler::Scope metricEvalStep("metric_eval");
+@@ -640,14 +786,15 @@
+     }
+   }
+ 
++  // The derivative is already in the field unless the metric reallocated it.
++  if (writeInPlace && metricDerivative.data_block() == gradientBuffer)
++  {
++    return gradientField;
++  }
++
+   // we rescale the update velocity field at each time point.
+   // we first need to convert to a displacement field to look
+   // at the max norm of the field.
+-
+-  auto gradientField = DisplacementFieldType::New();
+-  gradientField->CopyInformation(virtualDomainImage);
+-  gradientField->SetRegions(virtualDomainImage->GetRequestedRegion());
+-  gradientField->Allocate();
+ 
+   SizeValueType count = 0;
+   for (ImageRegionIterator<DisplacementFieldType> ItG(gradientField, gradientField->GetRequestedRegion());
+@@ -677,25 +824,36 @@
+ {
+   typename DisplacementFieldType::SpacingType spacing = updateField->GetSpacing();
+ 
+-  RealType maxNorm = NumericTraits<RealType>::NonpositiveMin();
+-  for (ImageRegionConstIterator<DisplacementFieldType> ItF(updateField, updateField->GetLargestPossibleRegion());
+-       !ItF.IsAtEnd();
+-       ++ItF)
+-  {
+-    DisplacementVectorType vector = ItF.Get();
+-
+-    RealType localNorm = 0;
+-    for (SizeValueType d = 0; d < ImageDimension; ++d)
+-    {
+-      localNorm += itk::Math::sqr(vector[d] / spacing[d]);
+-    }
+-    localNorm = std::sqrt(localNorm);
+-
+-    if (localNorm > maxNorm)
+-    {
+-      maxNorm = localNorm;
+-    }
+-  }
++  // Max of the per-voxel norms; a max is exact in any order, so reduce it in parallel.
++  RealType   maxNorm = NumericTraits<RealType>::NonpositiveMin();
++  std::mutex maxNormMutex;
++  this->GetMultiThreader()->template ParallelizeImageRegion<ImageDimension>(
++    updateField->GetLargestPossibleRegion(),
++    [&](const typename DisplacementFieldType::RegionType & region) {
++      RealType localMax = NumericTraits<RealType>::NonpositiveMin();
++      for (ImageRegionConstIterator<DisplacementFieldType> ItF(updateField, region); !ItF.IsAtEnd(); ++ItF)
++      {
++        DisplacementVectorType vector = ItF.Get();
++
++        RealType localNorm = 0;
++        for (SizeValueType d = 0; d < ImageDimension; ++d)
++        {
++          localNorm += itk::Math::sqr(vector[d] / spacing[d]);
++        }
++        localNorm = std::sqrt(localNorm);
++
++        if (localNorm > localMax)
++        {
++          localMax = localNorm;
++        }
++      }
++      const std::lock_guard<std::mutex> lock(maxNormMutex);
++      if (localMax > maxNorm)
++      {
++        maxNorm = localMax;
++      }
++    },
++    nullptr);
+ 
+   RealType scale = this->m_LearningRate;
+   if (maxNorm > RealType{})
+@@ -756,17 +914,16 @@
+   SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform, TVirtualImage, TPointSet>::
+     GaussianSmoothDisplacementField(const DisplacementFieldType * field, const RealType variance)
+ {
+-  using DuplicatorType = ImageDuplicator<DisplacementFieldType>;
+-  auto duplicator = DuplicatorType::New();
+-  duplicator->SetInputImage(field);
+-  duplicator->Update();
+-
+-  DisplacementFieldPointer smoothField = duplicator->GetOutput();
+-
+   if (variance <= 0.0)
+   {
+-    return smoothField;
+-  }
++    // Unsmoothed: the caller only reads the result, and every caller passes a freshly
++    // computed field, so hand it back instead of duplicating it.
++    return const_cast<DisplacementFieldType *>(field);
++  }
++
++  // The first pass reads the input directly; no need to duplicate it first.
++  DisplacementFieldPointer      smoothField;
++  const DisplacementFieldType * passInput = field;
+ 
+   using GaussianSmoothingOperatorType = GaussianOperator<RealType, ImageDimension>;
+   GaussianSmoothingOperatorType gaussianSmoothingOperator;
+@@ -775,18 +932,134 @@
+     VectorNeighborhoodOperatorImageFilter<DisplacementFieldType, DisplacementFieldType>;
+   auto smoother = GaussianSmoothingSmootherType::New();
+ 
+-  for (SizeValueType d = 0; d < ImageDimension; ++d)
++  // Direct separable passes. VectorNeighborhoodOperatorImageFilter computes, per output voxel
++  // and component, sum = 0; sum += c[t] * in[clamp(i + t - R)] for t = 0..2R along the pass
++  // direction (ZeroFluxNeumann boundary: out-of-range taps read the edge voxel), in the
++  // component type. These loops do exactly that, but over contiguous rows so they vectorize.
++  const auto & largestRegion = field->GetLargestPossibleRegion();
++  const bool   directPasses =
++    field->GetBufferedRegion() == largestRegion && field->GetRequestedRegion() == largestRegion;
++  for (SizeValueType d = 0; directPasses && d < ImageDimension; ++d)
++  {
++    using ValueType = typename DisplacementVectorType::ValueType;
++    constexpr unsigned int Components = DisplacementVectorType::Dimension;
++
++    gaussianSmoothingOperator.SetDirection(d);
++    gaussianSmoothingOperator.SetVariance(variance);
++    gaussianSmoothingOperator.SetMaximumError(0.001);
++    gaussianSmoothingOperator.SetMaximumKernelWidth(passInput->GetRequestedRegion().GetSize()[d]);
++    gaussianSmoothingOperator.CreateDirectional();
++    const Neighborhood<ValueType, ImageDimension> & kernel = gaussianSmoothingOperator;
++    const auto                                     radius = static_cast<IndexValueType>(kernel.GetRadius()[d]);
++    const std::vector<ValueType>                   coefficients(kernel.Begin(), kernel.End());
++    if (coefficients.size() != static_cast<size_t>(2 * radius + 1))
++    {
++      itkExceptionStringMacro("Unexpected directional Gaussian kernel size.");
++    }
++
++    const auto &                 size = largestRegion.GetSize();
++    const auto                   lineLength = static_cast<IndexValueType>(size[0]);
++    const auto                   extent = static_cast<IndexValueType>(size[d]);
++    SizeValueType                passStride = 1; // in voxels, along d
++    for (unsigned int k = 0; k < d; ++k)
++    {
++      passStride *= size[k];
++    }
++    const SizeValueType rows = largestRegion.GetNumberOfPixels() / size[0];
++
++    auto output = DisplacementFieldType::New();
++    output->CopyInformation(field);
++    output->SetRegions(largestRegion);
++    output->Allocate();
++
++    const auto * const src = reinterpret_cast<const ValueType *>(passInput->GetBufferPointer());
++    auto * const       dst = reinterpret_cast<ValueType *>(output->GetBufferPointer());
++    const auto         clampIndex = [](IndexValueType v, IndexValueType n) {
++      return v < 0 ? IndexValueType{ 0 } : (v >= n ? n - 1 : v);
++    };
++    constexpr SizeValueType chunks = 512;
++    this->GetMultiThreader()->ParallelizeArray(
++      0,
++      chunks,
++      [&](SizeValueType chunk) {
++        for (SizeValueType row = rows * chunk / chunks; row < rows * (chunk + 1) / chunks; ++row)
++        {
++          const SizeValueType rowStart = row * size[0]; // first voxel of the row
++          ValueType * ANTS_SYN_RESTRICT out = dst + rowStart * Components;
++          const SizeValueType           rowValues = static_cast<SizeValueType>(lineLength) * Components;
++          for (SizeValueType k = 0; k < rowValues; ++k)
++          {
++            out[k] = ValueType{};
++          }
++          if (d == 0)
++          {
++            const ValueType * ANTS_SYN_RESTRICT in = src + rowStart * Components;
++            // Interior voxels never clamp; edge voxels do.
++            const IndexValueType interiorBegin = std::min(radius, lineLength);
++            const IndexValueType interiorEnd = std::max(interiorBegin, lineLength - radius);
++            for (IndexValueType t = 0; t <= 2 * radius; ++t)
++            {
++              const ValueType       c = coefficients[t];
++              const OffsetValueType shift = (t - radius) * static_cast<OffsetValueType>(Components);
++              const auto kBegin = static_cast<OffsetValueType>(interiorBegin) * Components;
++              const auto kEnd = static_cast<OffsetValueType>(interiorEnd) * Components;
++              for (OffsetValueType k = kBegin; k < kEnd; ++k)
++              {
++                out[k] += c * in[k + shift];
++              }
++            }
++            for (IndexValueType x = 0; x < lineLength; ++x)
++            {
++              if (x >= interiorBegin && x < interiorEnd)
++              {
++                continue;
++              }
++              for (IndexValueType t = 0; t <= 2 * radius; ++t)
++              {
++                const IndexValueType xs = clampIndex(x + t - radius, lineLength);
++                for (unsigned int j = 0; j < Components; ++j)
++                {
++                  out[x * Components + j] += coefficients[t] * in[xs * Components + j];
++                }
++              }
++            }
++          }
++          else
++          {
++            const auto position = static_cast<IndexValueType>((rowStart / passStride) % size[d]);
++            for (IndexValueType t = 0; t <= 2 * radius; ++t)
++            {
++              const IndexValueType  source = clampIndex(position + t - radius, extent);
++              const OffsetValueType shift = (source - position) * static_cast<OffsetValueType>(passStride);
++              const ValueType * ANTS_SYN_RESTRICT in =
++                src + (static_cast<OffsetValueType>(rowStart) + shift) * static_cast<OffsetValueType>(Components);
++              const ValueType c = coefficients[t];
++              for (SizeValueType k = 0; k < rowValues; ++k)
++              {
++                out[k] += c * in[k];
++              }
++            }
++          }
++        }
++      },
++      nullptr);
++
++    smoothField = output;
++    passInput = smoothField;
++  }
++
++  for (SizeValueType d = 0; !directPasses && d < ImageDimension; ++d)
+   {
+     // smooth along this dimension
+     gaussianSmoothingOperator.SetDirection(d);
+     gaussianSmoothingOperator.SetVariance(variance);
+     gaussianSmoothingOperator.SetMaximumError(0.001);
+-    gaussianSmoothingOperator.SetMaximumKernelWidth(smoothField->GetRequestedRegion().GetSize()[d]);
++    gaussianSmoothingOperator.SetMaximumKernelWidth(passInput->GetRequestedRegion().GetSize()[d]);
+     gaussianSmoothingOperator.CreateDirectional();
+ 
+     // todo: make sure we only smooth within the buffered region
+     smoother->SetOperator(gaussianSmoothingOperator);
+-    smoother->SetInput(smoothField);
++    smoother->SetInput(passInput);
+     try
+     {
+       smoother->Update();
+@@ -801,6 +1074,7 @@
+     smoothField = smoother->GetOutput();
+     smoothField->Update();
+     smoothField->DisconnectPipeline();
++    passInput = smoothField;
+   }
+ 
+   constexpr DisplacementVectorType zeroVector{};
+@@ -817,28 +1091,34 @@
+   const typename DisplacementFieldType::SizeType   size = region.GetSize();
+   const typename DisplacementFieldType::IndexType  startIndex = region.GetIndex();
+ 
+-  ImageRegionIteratorWithIndex ItS(smoothField, smoothField->GetLargestPossibleRegion());
+-  for (ImageRegionConstIteratorWithIndex ItF(field, field->GetLargestPossibleRegion()); !ItF.IsAtEnd(); ++ItF, ++ItS)
+-  {
+-    typename DisplacementFieldType::IndexType index = ItF.GetIndex();
+-    bool                                      isOnBoundary = false;
+-    for (unsigned int d = 0; d < ImageDimension; ++d)
+-    {
+-      if (index[d] == startIndex[d] || index[d] == static_cast<IndexValueType>(size[d]) - startIndex[d] - 1)
++  // Per-voxel and independent, so split it across threads.
++  this->GetMultiThreader()->template ParallelizeImageRegion<ImageDimension>(
++    region,
++    [&](const typename DisplacementFieldType::RegionType & subRegion) {
++      ImageRegionIterator<DisplacementFieldType> ItS(smoothField, subRegion);
++      for (ImageRegionConstIteratorWithIndex ItF(field, subRegion); !ItF.IsAtEnd(); ++ItF, ++ItS)
+       {
+-        isOnBoundary = true;
+-        break;
++        typename DisplacementFieldType::IndexType index = ItF.GetIndex();
++        bool                                      isOnBoundary = false;
++        for (unsigned int d = 0; d < ImageDimension; ++d)
++        {
++          if (index[d] == startIndex[d] || index[d] == static_cast<IndexValueType>(size[d]) - startIndex[d] - 1)
++          {
++            isOnBoundary = true;
++            break;
++          }
++        }
++        if (isOnBoundary)
++        {
++          ItS.Set(zeroVector);
++        }
++        else
++        {
++          ItS.Set(ItS.Get() * weight1 + ItF.Get() * weight2);
++        }
+       }
+-    }
+-    if (isOnBoundary)
+-    {
+-      ItS.Set(zeroVector);
+-    }
+-    else
+-    {
+-      ItS.Set(ItS.Get() * weight1 + ItF.Get() * weight2);
+-    }
+-  }
++    },
++    nullptr);
+ 
+   return smoothField;
+ }
+diff --git a/Modules/Filtering/DisplacementField/include/itkInvertDisplacementFieldImageFilter.hxx b/Modules/Filtering/DisplacementField/include/itkInvertDisplacementFieldImageFilter.hxx
+--- a/Modules/Filtering/DisplacementField/include/itkInvertDisplacementFieldImageFilter.hxx
++++ b/Modules/Filtering/DisplacementField/include/itkInvertDisplacementFieldImageFilter.hxx
+@@ -23,6 +23,7 @@
+ #include "itkImageDuplicator.h"
+ #include "itkImageRegionIterator.h"
+ #include "itkImageRegionIteratorWithIndex.h"
++#include <algorithm>
+ #include <mutex>
+ #include "itkProgressTransformer.h"
+ 
+@@ -71,7 +72,6 @@
+ InvertDisplacementFieldImageFilter<TInputImage, TOutputImage>::GenerateData()
+ {
+   this->UpdateProgress(0.0f);
+-  this->AllocateOutputs();
+ 
+   constexpr VectorType zeroVector{};
+ 
+@@ -81,17 +81,35 @@
+ 
+   if (this->GetInverseFieldInitialEstimate())
+   {
+-    using DuplicatorType = ImageDuplicator<InverseDisplacementFieldType>;
+-    auto duplicator = DuplicatorType::New();
+-    duplicator->SetInputImage(this->GetInverseFieldInitialEstimate());
+-    duplicator->Update();
+-
+-    inverseDisplacementField = duplicator->GetOutput();
++    // The output is replaced by a copy of the estimate, so allocating it first would only
++    // add a full-size field to the peak. Copy the estimate as ImageDuplicator does, but in
++    // parallel chunks instead of one serial pass.
++    const InverseDisplacementFieldType * estimate = this->GetInverseFieldInitialEstimate();
++    inverseDisplacementField = InverseDisplacementFieldType::New();
++    inverseDisplacementField->CopyInformation(estimate);
++    inverseDisplacementField->SetRequestedRegion(estimate->GetRequestedRegion());
++    inverseDisplacementField->SetBufferedRegion(estimate->GetBufferedRegion());
++    inverseDisplacementField->Allocate();
++
++    const auto *        source = estimate->GetBufferPointer();
++    auto *              destination = inverseDisplacementField->GetBufferPointer();
++    const SizeValueType numberOfPixels = estimate->GetBufferedRegion().GetNumberOfPixels();
++    constexpr SizeValueType chunks = 256;
++    this->GetMultiThreader()->ParallelizeArray(
++      0,
++      chunks,
++      [&](SizeValueType chunk) {
++        const SizeValueType begin = numberOfPixels * chunk / chunks;
++        const SizeValueType end = numberOfPixels * (chunk + 1) / chunks;
++        std::copy(source + begin, source + end, destination + begin);
++      },
++      nullptr);
+ 
+     this->SetNthOutput(0, inverseDisplacementField);
+   }
+   else
+   {
++    this->AllocateOutputs();
+     inverseDisplacementField = this->GetOutput();
+     inverseDisplacementField->FillBuffer(zeroVector);
+   }
+@@ -103,7 +121,8 @@
+ 
+   this->m_ScaledNormImage->CopyInformation(displacementField);
+   this->m_ScaledNormImage->SetRegions(displacementField->GetRequestedRegion());
+-  this->m_ScaledNormImage->AllocateInitialized();
++  // Every voxel is written by the norm pass before the estimate pass reads it.
++  this->m_ScaledNormImage->Allocate();
+ 
+   const SizeValueType numberOfPixelsInRegion = (displacementField->GetRequestedRegion()).GetNumberOfPixels();
+   this->m_MaxErrorNorm = NumericTraits<RealType>::max();
+@@ -112,6 +131,14 @@
+ 
+   float oldProgress = 0.0f;
+ 
++  // One composer for all passes: its output buffer is reused instead of allocating (and
++  // page-faulting in) a new full-size field per pass. The warping field is updated in place
++  // by the estimate pass, so the composer is marked modified to re-run on each pass.
++  using ComposerType = ComposeDisplacementFieldsImageFilter<DisplacementFieldType>;
++  auto composer = ComposerType::New();
++  composer->SetDisplacementField(displacementField);
++  composer->SetWarpingField(inverseDisplacementField);
++
+   while ((iteration++ < this->m_MaximumNumberOfIterations) &&
+          (this->m_MaxErrorNorm > this->m_MaxErrorToleranceThreshold) &&
+          (this->m_MeanErrorNorm > this->m_MeanErrorToleranceThreshold))
+@@ -119,14 +146,9 @@
+     itkDebugMacro("Iteration " << iteration << ": mean error norm = " << this->m_MeanErrorNorm
+                                << ", max error norm = " << this->m_MaxErrorNorm);
+ 
+-    using ComposerType = ComposeDisplacementFieldsImageFilter<DisplacementFieldType>;
+-    auto composer = ComposerType::New();
+-    composer->SetDisplacementField(displacementField);
+-    composer->SetWarpingField(inverseDisplacementField);
+-
++    composer->Modified();
++    composer->Update();
+     this->m_ComposedField = composer->GetOutput();
+-    this->m_ComposedField->Update();
+-    this->m_ComposedField->DisconnectPipeline();
+ 
+     // Multithread processing to multiply each element of the composed field by 1 / spacing
+     this->m_MeanErrorNorm = RealType{};
+diff --git a/Modules/Filtering/DisplacementField/include/itkComposeDisplacementFieldsImageFilter.hxx b/Modules/Filtering/DisplacementField/include/itkComposeDisplacementFieldsImageFilter.hxx
+--- a/Modules/Filtering/DisplacementField/include/itkComposeDisplacementFieldsImageFilter.hxx
++++ b/Modules/Filtering/DisplacementField/include/itkComposeDisplacementFieldsImageFilter.hxx
+@@ -22,6 +22,8 @@
+ #include "itkImageRegionConstIteratorWithIndex.h"
+ #include "itkImageRegionIterator.h"
+ #include "itkVectorLinearInterpolateImageFunction.h"
++
++#include <typeinfo>
+ 
+ namespace itk
+ {
+@@ -62,7 +64,13 @@
+ {
+   constexpr VectorType zeroVector{};
+ 
+-  this->GetOutput()->FillBuffer(zeroVector);
++  // DynamicThreadedGenerateData writes every voxel of the requested region, so the
++  // (serial) zero fill is only needed for any buffered voxels outside it.
++  const auto * output = this->GetOutput();
++  if (output->GetBufferedRegion() != output->GetRequestedRegion())
++  {
++    this->GetOutput()->FillBuffer(zeroVector);
++  }
+ 
+   if (!this->m_Interpolator->GetInputImage())
+   {
+@@ -86,6 +94,13 @@
+ 
+   typename OutputFieldType::PixelType outDisplacement;
+ 
++  // With the default interpolator, IsInsideBuffer(point) and Evaluate(point) each convert the
++  // point to the same continuous index; convert once and use the index overloads instead.
++  using DefaultInterpolatorType = VectorLinearInterpolateImageFunction<InputFieldType, RealType>;
++  const InterpolatorType * interpolator = this->m_Interpolator.GetPointer();
++  const bool               convertOnce = typeid(*interpolator) == typeid(DefaultInterpolatorType);
++  const auto *             interpolatedField = interpolator->GetInputImage();
++
+   for (ItW.GoToBegin(), ItF.GoToBegin(); !ItW.IsAtEnd(); ++ItW, ++ItF)
+   {
+     warpingField->TransformIndexToPhysicalPoint(ItW.GetIndex(), pointIn1);
+@@ -98,7 +113,21 @@
+     }
+ 
+     typename InterpolatorType::OutputType displacement{};
+-    if (this->m_Interpolator->IsInsideBuffer(pointIn2))
++    if (convertOnce)
++    {
++      // The point overloads take the interpolator's point type, so the point is first
++      // converted to it (float for float fields); do the same conversion here.
++      const typename InterpolatorType::PointType interpolatorPoint(pointIn2);
++      const auto                                 cindex =
++        interpolatedField
++          ->template TransformPhysicalPointToContinuousIndex<typename InterpolatorType::ContinuousIndexType::ValueType>(
++            interpolatorPoint);
++      if (interpolator->IsInsideBuffer(cindex))
++      {
++        displacement = interpolator->EvaluateAtContinuousIndex(cindex);
++      }
++    }
++    else if (this->m_Interpolator->IsInsideBuffer(pointIn2))
+     {
+       displacement = this->m_Interpolator->Evaluate(pointIn2);
+     }

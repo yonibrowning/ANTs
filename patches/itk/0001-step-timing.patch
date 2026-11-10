@@ -1,0 +1,407 @@
+diff --git a/Modules/Filtering/DisplacementField/include/itkInvertDisplacementFieldImageFilter.h b/Modules/Filtering/DisplacementField/include/itkInvertDisplacementFieldImageFilter.h
+index e27d574..75f0cd2 100644
+--- a/Modules/Filtering/DisplacementField/include/itkInvertDisplacementFieldImageFilter.h
++++ b/Modules/Filtering/DisplacementField/include/itkInvertDisplacementFieldImageFilter.h
+@@ -202,6 +202,9 @@ public:
+   /* Get the mean norm */
+   itkGetConstMacro(MeanErrorNorm, RealType);
+ 
++  /** Number of fixed-point iterations the last Update() ran. */
++  itkGetConstMacro(ElapsedIterations, unsigned int);
++
+   /* Should we force the boundary to have zero displacement? */
+   itkSetMacro(EnforceBoundaryCondition, bool);
+   itkGetMacro(EnforceBoundaryCondition, bool);
+@@ -231,6 +234,7 @@ private:
+   typename InterpolatorType::Pointer m_Interpolator{};
+ 
+   unsigned int m_MaximumNumberOfIterations{ 20 };
++  unsigned int m_ElapsedIterations{ 0 };
+ 
+   RealType m_MaxErrorToleranceThreshold{};
+   RealType m_MeanErrorToleranceThreshold{};
+diff --git a/Modules/Filtering/DisplacementField/include/itkInvertDisplacementFieldImageFilter.hxx b/Modules/Filtering/DisplacementField/include/itkInvertDisplacementFieldImageFilter.hxx
+index 94f12fd..168d5b0 100644
+--- a/Modules/Filtering/DisplacementField/include/itkInvertDisplacementFieldImageFilter.hxx
++++ b/Modules/Filtering/DisplacementField/include/itkInvertDisplacementFieldImageFilter.hxx
+@@ -164,6 +164,8 @@ InvertDisplacementFieldImageFilter<TInputImage, TOutputImage>::GenerateData()
+       pt2.GetProcessObject());
+     oldProgress = newProgress;
+   }
++  // The loop condition post-increments once more than the number of passes it runs.
++  this->m_ElapsedIterations = iteration - 1;
+ 
+   this->UpdateProgress(1.0f);
+ }
+diff --git a/Modules/Registration/RegistrationMethodsv4/include/itkStepProfiler.h b/Modules/Registration/RegistrationMethodsv4/include/itkStepProfiler.h
+new file mode 100644
+index 0000000..a199f79
+--- /dev/null
++++ b/Modules/Registration/RegistrationMethodsv4/include/itkStepProfiler.h
+@@ -0,0 +1,178 @@
++/*=========================================================================
++ *
++ *  Profiling instrumentation for the SyN registration loop. Not part of upstream ITK.
++ *
++ *  ANTS_STEP_TIMING=1  print per-level wall time and call counts per step to stderr:
++ *                        [step] level=L name=NAME calls=N wall_s=S
++ *  ANTS_STEP_TRACE=1   also print a begin/end marker per call, for lining up an
++ *                      external memory poller:  [step+] NAME T  /  [step-] NAME T
++ *
++ *  With neither variable set every scope is a branch on a cached bool, and nothing is
++ *  printed, so registration output is unchanged.
++ *
++ *=========================================================================*/
++#ifndef itkStepProfiler_h
++#define itkStepProfiler_h
++
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <mutex>
++#include <string>
++
++namespace itk
++{
++namespace step_profiler
++{
++
++struct Totals
++{
++  double             seconds{ 0.0 };
++  unsigned long long calls{ 0 };
++};
++
++inline bool
++EnvFlag(const char * name)
++{
++  const char * v = std::getenv(name);
++  return v != nullptr && *v != '\0' && *v != '0';
++}
++
++inline bool
++Enabled()
++{
++  static const bool on = EnvFlag("ANTS_STEP_TIMING") || EnvFlag("ANTS_STEP_TRACE");
++  return on;
++}
++
++inline bool
++Trace()
++{
++  static const bool on = EnvFlag("ANTS_STEP_TRACE");
++  return on;
++}
++
++inline double
++Now()
++{
++  using Clock = std::chrono::steady_clock;
++  static const Clock::time_point start = Clock::now();
++  return std::chrono::duration<double>(Clock::now() - start).count();
++}
++
++inline std::mutex &
++Mutex()
++{
++  static std::mutex m;
++  return m;
++}
++
++// std::map keeps the report order stable, which makes runs easy to diff.
++inline std::map<std::string, Totals> &
++Table()
++{
++  static std::map<std::string, Totals> t;
++  return t;
++}
++
++inline std::map<unsigned int, unsigned long long> &
++InverterHistogram()
++{
++  static std::map<unsigned int, unsigned long long> h;
++  return h;
++}
++
++class Scope
++{
++public:
++  explicit Scope(const char * name)
++    : m_Name(name)
++    , m_Active(Enabled())
++  {
++    if (m_Active)
++    {
++      m_Start = Now();
++      if (Trace())
++      {
++        std::fprintf(stderr, "[step+] %s %.6f\n", m_Name, m_Start);
++        std::fflush(stderr);
++      }
++    }
++  }
++
++  ~Scope() { Stop(); }
++
++  Scope(const Scope &) = delete;
++  Scope &
++  operator=(const Scope &) = delete;
++
++  void
++  Stop()
++  {
++    if (!m_Active)
++    {
++      return;
++    }
++    m_Active = false;
++    const double end = Now();
++    if (Trace())
++    {
++      std::fprintf(stderr, "[step-] %s %.6f\n", m_Name, end);
++      std::fflush(stderr);
++    }
++    const std::lock_guard<std::mutex> lock(Mutex());
++    Totals &                          t = Table()[m_Name];
++    t.seconds += end - m_Start;
++    ++t.calls;
++  }
++
++private:
++  const char * m_Name;
++  bool         m_Active;
++  double       m_Start{ 0.0 };
++};
++
++inline void
++RecordInverterIterations(unsigned int iterations)
++{
++  if (!Enabled())
++  {
++    return;
++  }
++  const std::lock_guard<std::mutex> lock(Mutex());
++  ++InverterHistogram()[iterations];
++}
++
++// Prints and clears everything accumulated since the last report.
++inline void
++Report(const char * level, unsigned long long voxels, unsigned int workUnits, unsigned int threads)
++{
++  if (!Enabled())
++  {
++    return;
++  }
++  const std::lock_guard<std::mutex> lock(Mutex());
++  std::fprintf(stderr, "[step] level=%s voxels=%llu work_units=%u threads=%u\n", level, voxels, workUnits, threads);
++  for (const auto & entry : Table())
++  {
++    std::fprintf(stderr,
++                 "[step] level=%s name=%s calls=%llu wall_s=%.6f\n",
++                 level,
++                 entry.first.c_str(),
++                 entry.second.calls,
++                 entry.second.seconds);
++  }
++  for (const auto & entry : InverterHistogram())
++  {
++    std::fprintf(stderr, "[step] level=%s inverter_iterations=%u count=%llu\n", level, entry.first, entry.second);
++  }
++  std::fflush(stderr);
++  Table().clear();
++  InverterHistogram().clear();
++}
++
++} // namespace step_profiler
++} // namespace itk
++
++#endif
+diff --git a/Modules/Registration/RegistrationMethodsv4/include/itkSyNImageRegistrationMethod.hxx b/Modules/Registration/RegistrationMethodsv4/include/itkSyNImageRegistrationMethod.hxx
+index d19f1ac..d6dfd55 100644
+--- a/Modules/Registration/RegistrationMethodsv4/include/itkSyNImageRegistrationMethod.hxx
++++ b/Modules/Registration/RegistrationMethodsv4/include/itkSyNImageRegistrationMethod.hxx
+@@ -26,6 +26,8 @@
+ #include "itkInvertDisplacementFieldImageFilter.h"
+ #include "itkIterationReporter.h"
+ #include "itkMultiplyImageFilter.h"
++#include "itkMultiThreaderBase.h"
++#include "itkStepProfiler.h"
+ #include "itkVectorNeighborhoodOperatorImageFilter.h"
+ #include "itkWindowConvergenceMonitoringFunction.h"
+ 
+@@ -207,21 +209,29 @@ SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform, TVirtual
+ 
+     using ComposerType = ComposeDisplacementFieldsImageFilter<DisplacementFieldType>;
+ 
+-    auto fixedComposer = ComposerType::New();
++    step_profiler::Scope composeFixedStep("compose");
++    auto                 fixedComposer = ComposerType::New();
+     fixedComposer->SetDisplacementField(fixedToMiddleSmoothUpdateField);
+     fixedComposer->SetWarpingField(this->m_FixedToMiddleTransform->GetDisplacementField());
+     fixedComposer->Update();
++    composeFixedStep.Stop();
+ 
++    step_profiler::Scope           smoothTotalFixedStep("smooth_total");
+     const DisplacementFieldPointer fixedToMiddleSmoothTotalFieldTmp = this->GaussianSmoothDisplacementField(
+       fixedComposer->GetOutput(), this->m_GaussianSmoothingVarianceForTheTotalField);
++    smoothTotalFixedStep.Stop();
+ 
+-    auto movingComposer = ComposerType::New();
++    step_profiler::Scope composeMovingStep("compose");
++    auto                 movingComposer = ComposerType::New();
+     movingComposer->SetDisplacementField(movingToMiddleSmoothUpdateField);
+     movingComposer->SetWarpingField(this->m_MovingToMiddleTransform->GetDisplacementField());
+     movingComposer->Update();
++    composeMovingStep.Stop();
+ 
++    step_profiler::Scope           smoothTotalMovingStep("smooth_total");
+     const DisplacementFieldPointer movingToMiddleSmoothTotalFieldTmp = this->GaussianSmoothDisplacementField(
+       movingComposer->GetOutput(), this->m_GaussianSmoothingVarianceForTheTotalField);
++    smoothTotalMovingStep.Stop();
+ 
+     // Iteratively estimate the inverse fields.
+ 
+@@ -283,10 +293,13 @@ typename SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform,
+                                                                                         movingImageMasks,
+                                                                                         value);
+ 
++  step_profiler::Scope           smoothUpdateStep("smooth_update");
+   const DisplacementFieldPointer updateField =
+     this->GaussianSmoothDisplacementField(metricGradientField, this->m_GaussianSmoothingVarianceForTheUpdateField);
++  smoothUpdateStep.Stop();
+ 
+-  DisplacementFieldPointer scaledUpdateField = this->ScaleUpdateField(updateField);
++  const step_profiler::Scope scaleUpdateStep("scale_update");
++  DisplacementFieldPointer   scaledUpdateField = this->ScaleUpdateField(updateField);
+ 
+   return scaledUpdateField;
+ }
+@@ -346,6 +359,7 @@ typename SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform,
+         }
+         else
+         {
++          step_profiler::Scope resampleImagesStep("resample_images");
+           using FixedResamplerType = ResampleImageFilter<FixedImageType, FixedImageType, RealType>;
+           auto fixedResampler = FixedResamplerType::New();
+           fixedResampler->SetInput(fixedImages[n]);
+@@ -366,6 +380,8 @@ typename SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform,
+ 
+           multiMetric->GetMetricQueue()[n]->SetFixedObject(fixedResampler->GetOutput());
+           multiMetric->GetMetricQueue()[n]->SetMovingObject(movingResampler->GetOutput());
++          resampleImagesStep.Stop();
++          const step_profiler::Scope resampleMasksStep("resample_masks");
+ 
+           if (fixedImageMasks[n])
+           {
+@@ -478,6 +494,7 @@ typename SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform,
+       }
+       else
+       {
++        step_profiler::Scope resampleImagesStep("resample_images");
+         using FixedResamplerType = ResampleImageFilter<FixedImageType, FixedImageType, RealType>;
+         auto fixedResampler = FixedResamplerType::New();
+         fixedResampler->SetInput(fixedImages[0]);
+@@ -498,6 +515,8 @@ typename SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform,
+ 
+         this->m_Metric->SetFixedObject(fixedResampler->GetOutput());
+         this->m_Metric->SetMovingObject(movingResampler->GetOutput());
++        resampleImagesStep.Stop();
++        const step_profiler::Scope resampleMasksStep("resample_masks");
+ 
+         if (fixedImageMasks[0])
+         {
+@@ -564,7 +583,8 @@ typename SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform,
+   if (this->m_DownsampleImagesForMetricDerivatives &&
+       this->m_Metric->GetMetricCategory() != ObjectToObjectMetricBaseTemplateEnums::MetricCategory::POINT_SET_METRIC)
+   {
+-    auto identityField = DisplacementFieldType::New();
++    const step_profiler::Scope identityFieldStep("identity_field");
++    auto                       identityField = DisplacementFieldType::New();
+     identityField->CopyInformation(virtualDomainImage);
+     identityField->SetRegions(virtualDomainImage->GetLargestPossibleRegion());
+     identityField->AllocateInitialized();
+@@ -587,15 +607,24 @@ typename SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform,
+     }
+   }
+ 
++  step_profiler::Scope metricInitStep("metric_init");
+   this->m_Metric->Initialize();
++  metricInitStep.Stop();
+ 
++  step_profiler::Scope derivativeAllocStep("derivative_alloc");
+   using MetricDerivativeType = typename ImageMetricType::DerivativeType;
+   const typename MetricDerivativeType::SizeValueType metricDerivativeSize =
+     virtualDomainImage->GetLargestPossibleRegion().GetNumberOfPixels() * ImageDimension;
+   MetricDerivativeType metricDerivative(metricDerivativeSize);
+ 
+   metricDerivative.Fill(typename MetricDerivativeType::ValueType{});
++  derivativeAllocStep.Stop();
++
++  step_profiler::Scope metricEvalStep("metric_eval");
+   this->m_Metric->GetValueAndDerivative(value, metricDerivative);
++  metricEvalStep.Stop();
++
++  const step_profiler::Scope derivativeCopyStep("derivative_copy");
+ 
+   // Ensure that the size of the optimizer weights is the same as the
+   // number of local transform parameters (=ImageDimension)
+@@ -706,7 +735,11 @@ typename SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform,
+   inverter->SetMaximumNumberOfIterations(20);
+   inverter->SetMeanErrorToleranceThreshold(0.001);
+   inverter->SetMaxErrorToleranceThreshold(0.1);
+-  inverter->Update();
++  {
++    const step_profiler::Scope invertStep("invert");
++    inverter->Update();
++  }
++  step_profiler::RecordInverterIterations(inverter->GetElapsedIterations());
+ 
+   DisplacementFieldPointer inverseField = inverter->GetOutput();
+ 
+@@ -820,9 +853,12 @@ SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform, TVirtual
+ {
+   this->AllocateOutputs();
+ 
++  const unsigned int threads = MultiThreaderBase::GetGlobalDefaultNumberOfThreads();
+   for (this->m_CurrentLevel = 0; this->m_CurrentLevel < this->m_NumberOfLevels; this->m_CurrentLevel++)
+   {
++    step_profiler::Scope levelInitStep("level_init");
+     this->InitializeRegistrationAtEachLevel(this->m_CurrentLevel);
++    levelInitStep.Stop();
+ 
+     // The base class adds the transform to be optimized at initialization.
+     // However, since this class handles its own optimization, we remove it
+@@ -830,11 +866,20 @@ SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform, TVirtual
+ 
+     this->m_CompositeTransform->RemoveTransform();
+ 
++    step_profiler::Scope optimizeStep("optimize");
+     this->StartOptimization();
++    optimizeStep.Stop();
+ 
+     this->m_CompositeTransform->AddTransform(this->m_OutputTransform);
++
++    const std::string levelName = std::to_string(this->m_CurrentLevel);
++    step_profiler::Report(levelName.c_str(),
++                          this->GetCurrentLevelVirtualDomainImage()->GetLargestPossibleRegion().GetNumberOfPixels(),
++                          this->GetNumberOfWorkUnits(),
++                          threads);
+   }
+ 
++  step_profiler::Scope finalComposeStep("final_compose");
+   using ComposerType = ComposeDisplacementFieldsImageFilter<DisplacementFieldType, DisplacementFieldType>;
+ 
+   auto composer = ComposerType::New();
+@@ -849,6 +894,11 @@ SyNImageRegistrationMethod<TFixedImage, TMovingImage, TOutputTransform, TVirtual
+ 
+   this->m_OutputTransform->SetDisplacementField(composer->GetOutput());
+   this->m_OutputTransform->SetInverseDisplacementField(inverseComposer->GetOutput());
++  finalComposeStep.Stop();
++  step_profiler::Report("final",
++                        this->m_OutputTransform->GetDisplacementField()->GetLargestPossibleRegion().GetNumberOfPixels(),
++                        this->GetNumberOfWorkUnits(),
++                        threads);
+ 
+   this->GetTransformOutput()->Set(this->m_OutputTransform);
+ }

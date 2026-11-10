@@ -1,0 +1,570 @@
+diff --git a/Modules/Registration/Metricsv4/include/itkANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader.h b/Modules/Registration/Metricsv4/include/itkANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader.h
+index 543b6caea5..51ef93c755 100644
+--- a/Modules/Registration/Metricsv4/include/itkANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader.h
++++ b/Modules/Registration/Metricsv4/include/itkANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader.h
+@@ -22,6 +22,7 @@
+ #include "itkThreadedImageRegionPartitioner.h"
+ #include "itkThreadedIndexedContainerPartitioner.h"
+ #include "itkConstNeighborhoodIterator.h"
++#include "itkMultiThreaderBase.h"
+ 
+ #include <deque>
+ #include <mutex>
+@@ -295,11 +296,46 @@ protected:
+                                    MeasureType &              localCC,
+                                    const ThreadIdType         threadId) const;
+ 
++  /** Decides, once per evaluation, whether the dense fast path applies. */
++  void
++  BeforeThreadedExecution() override;
++
++  /** True when the fixed and moving images share the virtual grid, both transforms are
++   * zero displacement fields, interpolation is linear and there are no masks. That is
++   * what SyN-type methods set up when DownsampleImagesForMetricDerivatives is on. Every
++   * sample then lands exactly on a voxel, so it can be read straight from the buffers.
++   * Set ITK_ANTS_CC_FAST_PATH=0 to disable. */
++  bool
++  CanUseFastPath();
++
++  /** Same computation as the dense ThreadedExecution_impl, in the same order and types, but
++   * reading neighborhood samples from the image buffers instead of through the transforms
++   * and interpolators. */
++  void
++  FastThreadedExecution(const DomainType & virtualImageSubRegion, const ThreadIdType threadId);
++
+ private:
+   /** Internal pointer to the metric object in use by this threader.
+    *  This will avoid costly dynamic casting in tight loops. */
+   TNeighborhoodCorrelationMetric * m_ANTSAssociate{};
+   std::once_flag                   m_ANTSAssociateOnceFlag{};
++  bool                             m_UseFastPath{ false };
++  MultiThreaderBase::Pointer       m_FastPathCheckThreader{};
++
++  /** A mask resampled onto the virtual grid, read by voxel offset. */
++  struct GridMask
++  {
++    const unsigned char * buffer{ nullptr };
++    bool                  useMaskValue{ false };
++    unsigned char         maskValue{ 0 };
++    bool
++    Inside(OffsetValueType offset) const
++    {
++      return useMaskValue ? buffer[offset] == maskValue : buffer[offset] != 0;
++    }
++  };
++  GridMask m_FixedGridMask{};
++  GridMask m_MovingGridMask{};
+ };
+ 
+ 
+diff --git a/Modules/Registration/Metricsv4/include/itkANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader.hxx b/Modules/Registration/Metricsv4/include/itkANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader.hxx
+index bb0b285e95..e84fd2e893 100644
+--- a/Modules/Registration/Metricsv4/include/itkANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader.hxx
++++ b/Modules/Registration/Metricsv4/include/itkANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader.hxx
+@@ -18,10 +18,69 @@
+ #ifndef itkANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader_hxx
+ #define itkANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader_hxx
+ 
++#include "itkDisplacementFieldTransform.h"
++#include "itkImageMaskSpatialObject.h"
++#include "itkLinearInterpolateImageFunction.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cstdlib>
++#include <type_traits>
++#include <vector>
++
++#if defined(_MSC_VER)
++#  define ANTS_CC_RESTRICT __restrict
++#else
++#  define ANTS_CC_RESTRICT __restrict__
++#endif
+ 
+ namespace itk
+ {
+ 
++namespace ants_cc_fast_path
++{
++/** True if the transform is a displacement field transform whose field is all zeros, i.e. the identity. */
++template <typename TTransform>
++bool
++IsZeroDisplacementFieldTransform(const TTransform * transform, MultiThreaderBase * threader)
++{
++  using DisplacementFieldTransformType =
++    DisplacementFieldTransform<typename TTransform::ParametersValueType, TTransform::InputSpaceDimension>;
++  const auto * dft = dynamic_cast<const DisplacementFieldTransformType *>(transform);
++  if (dft == nullptr)
++  {
++    return false;
++  }
++  const auto * field = dft->GetDisplacementField();
++  if (field == nullptr || field->GetBufferPointer() == nullptr)
++  {
++    return false;
++  }
++  using ValueType = typename DisplacementFieldTransformType::DisplacementFieldType::PixelType::ValueType;
++  const auto *        values = reinterpret_cast<const ValueType *>(field->GetBufferPointer());
++  const SizeValueType count = field->GetBufferedRegion().GetNumberOfPixels() * TTransform::InputSpaceDimension;
++  constexpr SizeValueType chunks = 256;
++  std::atomic<bool>       nonzero{ false };
++  threader->ParallelizeArray(
++    0,
++    chunks,
++    [&](SizeValueType chunk) {
++      const SizeValueType begin = count * chunk / chunks;
++      const SizeValueType end = count * (chunk + 1) / chunks;
++      for (SizeValueType i = begin; i < end; ++i)
++      {
++        if (!(values[i] == ValueType{}))
++        {
++          nonzero = true;
++          return;
++        }
++      }
++    },
++    nullptr);
++  return !nonzero;
++}
++} // namespace ants_cc_fast_path
++
+ template <typename TDomainPartitioner, typename TImageToImageMetric, typename TNeighborhoodCorrelationMetric>
+ void
+ ANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader<TDomainPartitioner,
+@@ -41,6 +100,12 @@ ANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader<TDo
+ 
+   std::call_once(this->m_ANTSAssociateOnceFlag, [this, &associate]() { this->m_ANTSAssociate = associate; });
+ 
++  if (this->m_UseFastPath)
++  {
++    this->FastThreadedExecution(virtualImageSubRegion, threadId);
++    return;
++  }
++
+   VirtualPointType   virtualPoint;
+   MeasureType        metricValueResult{};
+   MeasureType        metricValueSum{};
+@@ -575,6 +640,423 @@ ANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader<
+   }
+ }
+ 
++template <typename TDomainPartitioner, typename TImageToImageMetric, typename TNeighborhoodCorrelationMetric>
++void
++ANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader<
++  TDomainPartitioner,
++  TImageToImageMetric,
++  TNeighborhoodCorrelationMetric>::BeforeThreadedExecution()
++{
++  Superclass::BeforeThreadedExecution();
++  this->m_UseFastPath = false;
++  if constexpr (std::is_same_v<TDomainPartitioner,
++                               ThreadedImageRegionPartitioner<TImageToImageMetric::VirtualImageDimension>>)
++  {
++    this->m_UseFastPath = this->CanUseFastPath();
++  }
++}
++
++template <typename TDomainPartitioner, typename TImageToImageMetric, typename TNeighborhoodCorrelationMetric>
++bool
++ANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader<
++  TDomainPartitioner,
++  TImageToImageMetric,
++  TNeighborhoodCorrelationMetric>::CanUseFastPath()
++{
++  this->m_FixedGridMask = GridMask{};
++  this->m_MovingGridMask = GridMask{};
++  const char * env = std::getenv("ITK_ANTS_CC_FAST_PATH");
++  if (env != nullptr && env[0] == '0')
++  {
++    return false;
++  }
++  const auto * associate = dynamic_cast<const TNeighborhoodCorrelationMetric *>(this->m_Associate);
++  if (associate == nullptr || associate->m_FixedImage.IsNull() || associate->m_MovingImage.IsNull())
++  {
++    return false;
++  }
++
++  using CoordinateType = typename TNeighborhoodCorrelationMetric::CoordinateRepresentationType;
++  if (dynamic_cast<const LinearInterpolateImageFunction<FixedImageType, CoordinateType> *>(
++        associate->m_FixedInterpolator.GetPointer()) == nullptr ||
++      dynamic_cast<const LinearInterpolateImageFunction<MovingImageType, CoordinateType> *>(
++        associate->m_MovingInterpolator.GetPointer()) == nullptr)
++  {
++    return false;
++  }
++
++  // Every voxel of the virtual region must be a voxel of both image buffers.
++  const VirtualImageType * virtualImage = associate->GetVirtualImage();
++  if (virtualImage == nullptr)
++  {
++    return false;
++  }
++  const auto sameGrid = [virtualImage](const auto * image) {
++    return image->GetBufferPointer() != nullptr && image->GetBufferedRegion() == virtualImage->GetBufferedRegion() &&
++           image->GetOrigin() == virtualImage->GetOrigin() && image->GetSpacing() == virtualImage->GetSpacing() &&
++           image->GetDirection() == virtualImage->GetDirection();
++  };
++  if (!sameGrid(associate->m_FixedImage.GetPointer()) || !sameGrid(associate->m_MovingImage.GetPointer()) ||
++      // The original zero-fills hyperplanes outside the virtual region, not the buffer.
++      !(virtualImage->GetBufferedRegion() == associate->GetVirtualRegion()))
++  {
++    return false;
++  }
++
++  // Masks are supported when they are image masks on the same grid with identity
++  // object-to-world transforms (what SyN's resampled masks are), so that the
++  // nearest-voxel lookup in IsInsideInWorldSpace is the voxel itself.
++  using GridMaskSpatialObjectType = ImageMaskSpatialObject<TImageToImageMetric::VirtualImageDimension, unsigned char>;
++  const auto toGridMask = [&](const auto * spatialObject, GridMask & out) {
++    if (spatialObject == nullptr)
++    {
++      return true;
++    }
++    const auto * mask = dynamic_cast<const GridMaskSpatialObjectType *>(spatialObject);
++    if (mask == nullptr || mask->GetImage() == nullptr || !sameGrid(mask->GetImage()) ||
++        !(mask->GetBufferedRegion() == virtualImage->GetBufferedRegion()))
++    {
++      return false;
++    }
++    const auto isIdentity = [](const auto * transform) {
++      return transform != nullptr && transform->GetMatrix().GetVnlMatrix().is_identity() &&
++             transform->GetOffset().GetSquaredNorm() == 0.0;
++    };
++    if (!isIdentity(mask->GetObjectToWorldTransform()) || !isIdentity(mask->GetObjectToWorldTransformInverse()))
++    {
++      return false;
++    }
++    out.buffer = mask->GetImage()->GetBufferPointer();
++    out.useMaskValue = mask->GetUseMaskValue();
++    out.maskValue = mask->GetMaskValue();
++    return true;
++  };
++  if (!toGridMask(associate->m_FixedImageMask.GetPointer(), this->m_FixedGridMask) ||
++      !toGridMask(associate->m_MovingImageMask.GetPointer(), this->m_MovingGridMask))
++  {
++    this->m_FixedGridMask = GridMask{};
++    this->m_MovingGridMask = GridMask{};
++    return false;
++  }
++
++  // Both transforms must be the identity.
++  if (this->m_FastPathCheckThreader.IsNull())
++  {
++    this->m_FastPathCheckThreader = MultiThreaderBase::New();
++  }
++  const auto * fixedTransform = associate->GetFixedTransform();
++  const auto * movingTransform = associate->GetMovingTransform();
++  if (!ants_cc_fast_path::IsZeroDisplacementFieldTransform(movingTransform, this->m_FastPathCheckThreader) ||
++      (static_cast<const void *>(fixedTransform) != static_cast<const void *>(movingTransform) &&
++       !ants_cc_fast_path::IsZeroDisplacementFieldTransform(fixedTransform, this->m_FastPathCheckThreader)))
++  {
++    this->m_FixedGridMask = GridMask{};
++    this->m_MovingGridMask = GridMask{};
++    return false;
++  }
++  return true;
++}
++
++template <typename TDomainPartitioner, typename TImageToImageMetric, typename TNeighborhoodCorrelationMetric>
++void
++ANTSNeighborhoodCorrelationImageToImageMetricv4GetValueAndDerivativeThreader<
++  TDomainPartitioner,
++  TImageToImageMetric,
++  TNeighborhoodCorrelationMetric>::FastThreadedExecution(const DomainType & virtualImageSubRegion,
++                                                         const ThreadIdType threadId)
++{
++  constexpr unsigned int Dimension = TImageToImageMetric::VirtualImageDimension;
++  using LocalRealType = InternalComputationValueType;
++  using IndexType = typename VirtualImageType::IndexType;
++  using OffsetType = typename VirtualImageType::OffsetType;
++  using MovingTransformPointType = typename TNeighborhoodCorrelationMetric::MovingTransformType::OutputPointType;
++  constexpr LocalRealType localZero{};
++
++  TNeighborhoodCorrelationMetric * associate = this->m_ANTSAssociate;
++  const VirtualImageType *         virtualImage = associate->GetVirtualImage();
++  const auto &                     buffered = virtualImage->GetBufferedRegion();
++  const auto *                     fixedBuffer = associate->m_FixedImage->GetBufferPointer();
++  const auto *                     movingBuffer = associate->m_MovingImage->GetBufferPointer();
++  const RadiusType                 radius = associate->GetRadius();
++  const auto                       r0 = static_cast<IndexValueType>(radius[0]);
++  const auto                       windowLength = static_cast<SizeValueType>(2 * r0 + 1);
++  const bool                       computeDerivative = associate->GetComputeDerivative();
++  const bool                       needMovingGradient = computeDerivative && associate->GetGradientSourceIncludesMoving();
++  const GridMask                   fixedMask = this->m_FixedGridMask;
++  const GridMask                   movingMask = this->m_MovingGridMask;
++
++  IndexType       bufferStart = buffered.GetIndex();
++  IndexType       bufferEnd;
++  OffsetValueType stride[Dimension];
++  for (unsigned int d = 0; d < Dimension; ++d)
++  {
++    bufferEnd[d] = bufferStart[d] + static_cast<IndexValueType>(buffered.GetSize()[d]);
++    stride[d] = (d == 0) ? 1 : stride[d - 1] * static_cast<OffsetValueType>(buffered.GetSize()[d - 1]);
++  }
++
++  // The neighborhood offsets of one hyperplane (fixed dim-0 offset), in the order
++  // ConstNeighborhoodIterator numbers them: dimension 1 fastest.
++  std::vector<OffsetType> hyperplaneOffsets;
++  {
++    OffsetType offset;
++    offset.Fill(0);
++    for (unsigned int d = 1; d < Dimension; ++d)
++    {
++      offset[d] = -static_cast<OffsetValueType>(radius[d]);
++    }
++    while (true)
++    {
++      hyperplaneOffsets.push_back(offset);
++      unsigned int d = 1;
++      for (; d < Dimension; ++d)
++      {
++        if (++offset[d] <= static_cast<OffsetValueType>(radius[d]))
++        {
++          break;
++        }
++        offset[d] = -static_cast<OffsetValueType>(radius[d]);
++      }
++      if (d == Dimension)
++      {
++        break;
++      }
++    }
++  }
++
++  enum
++  {
++    Fixed2 = 0,
++    Moving2,
++    FixedSum,
++    MovingSum,
++    FixedMoving,
++    Count,
++    NumberOfSums
++  };
++
++  MeasureType        metricValueResult{};
++  MeasureType        metricValueSum{};
++  ScanIteratorType   unusedScanIt;
++  ScanParametersType unusedScanParameters;
++  ScanMemType        scanMem;
++  scanMem.fixedImageGradient.Fill(0.0);
++  scanMem.movingImageGradient.Fill(0.0);
++  scanMem.mappedMovingPoint.Fill(0.0);
++
++  DerivativeType & localDerivativeResult = this->m_GetValueAndDerivativePerThreadVariables[threadId].LocalDerivatives;
++
++  const IndexType     regionStart = virtualImageSubRegion.GetIndex();
++  const auto &        regionSize = virtualImageSubRegion.GetSize();
++  const IndexValueType xBegin = regionStart[0];
++  const IndexValueType xEnd = regionStart[0] + static_cast<IndexValueType>(regionSize[0]);
++  if (virtualImageSubRegion.GetNumberOfPixels() == 0)
++  {
++    this->m_GetValueAndDerivativePerThreadVariables[threadId].Measure = metricValueSum;
++    return;
++  }
++
++  // Per-line work arrays. The original keeps a queue of the window's 2*r0+1 hyperplane sums
++  // and refills it per voxel; here every hyperplane of a line is summed in one sweep over the
++  // contiguous rows (so the inner loop runs over x and vectorizes), then each voxel's window
++  // is summed from them. Each hyperplane still accumulates its samples in neighborhood order
++  // and each window still sums its hyperplanes oldest to newest, as in the original, so every
++  // per-voxel value is computed with the same operations in the same order.
++  const auto                 lineLength = static_cast<SizeValueType>(xEnd - xBegin);
++  const SizeValueType        planeCount = lineLength + 2 * static_cast<SizeValueType>(r0);
++  std::vector<LocalRealType> planeStorage(NumberOfSums * planeCount);
++  std::vector<LocalRealType> windowStorage(NumberOfSums * lineLength);
++  LocalRealType *            plane[NumberOfSums];
++  LocalRealType *            window[NumberOfSums];
++  for (unsigned int s = 0; s < NumberOfSums; ++s)
++  {
++    plane[s] = planeStorage.data() + s * planeCount;
++    window[s] = windowStorage.data() + s * lineLength;
++  }
++  const bool hasMask = fixedMask.buffer != nullptr || movingMask.buffer != nullptr;
++
++  IndexType index = regionStart;
++  while (true)
++  {
++    // Hyperplane h covers dim-0 coordinate x = xBegin - r0 + h; those outside the buffer stay zero.
++    std::fill(planeStorage.begin(), planeStorage.end(), localZero);
++    const IndexValueType planeX0 = std::max(xBegin - r0, bufferStart[0]);
++    const IndexValueType planeX1 = std::min(xEnd + r0, bufferEnd[0]); // exclusive
++    for (const OffsetType & offset : hyperplaneOffsets)
++    {
++      OffsetValueType rowStart = 0;
++      bool            inBounds = true;
++      for (unsigned int d = 1; d < Dimension; ++d)
++      {
++        const IndexValueType v = index[d] + offset[d];
++        if (v < bufferStart[d] || v >= bufferEnd[d])
++        {
++          inBounds = false;
++          break;
++        }
++        rowStart += (v - bufferStart[d]) * stride[d];
++      }
++      if (!inBounds || planeX1 <= planeX0)
++      {
++        continue;
++      }
++      const SizeValueType   n = static_cast<SizeValueType>(planeX1 - planeX0);
++      const OffsetValueType first = rowStart + (planeX0 - bufferStart[0]);
++      const SizeValueType   h0 = static_cast<SizeValueType>(planeX0 - (xBegin - r0));
++      const auto * ANTS_CC_RESTRICT fixedRow = fixedBuffer + first;
++      const auto * ANTS_CC_RESTRICT movingRow = movingBuffer + first;
++      LocalRealType * ANTS_CC_RESTRICT pFixed2 = plane[Fixed2] + h0;
++      LocalRealType * ANTS_CC_RESTRICT pMoving2 = plane[Moving2] + h0;
++      LocalRealType * ANTS_CC_RESTRICT pFixed = plane[FixedSum] + h0;
++      LocalRealType * ANTS_CC_RESTRICT pMoving = plane[MovingSum] + h0;
++      LocalRealType * ANTS_CC_RESTRICT pFixedMoving = plane[FixedMoving] + h0;
++      LocalRealType * ANTS_CC_RESTRICT pCount = plane[Count] + h0;
++      if (!hasMask)
++      {
++        for (SizeValueType i = 0; i < n; ++i)
++        {
++          const FixedImagePixelType  fixedImageValue = fixedRow[i];
++          const MovingImagePixelType movingImageValue = movingRow[i];
++          pFixed2[i] += fixedImageValue * fixedImageValue;
++          pMoving2[i] += movingImageValue * movingImageValue;
++          pFixed[i] += fixedImageValue;
++          pMoving[i] += movingImageValue;
++          pFixedMoving[i] += fixedImageValue * movingImageValue;
++          pCount[i] += NumericTraits<LocalRealType>::OneValue();
++        }
++      }
++      else
++      {
++        for (SizeValueType i = 0; i < n; ++i)
++        {
++          const OffsetValueType linear = first + static_cast<OffsetValueType>(i);
++          if ((fixedMask.buffer != nullptr && !fixedMask.Inside(linear)) ||
++              (movingMask.buffer != nullptr && !movingMask.Inside(linear)))
++          {
++            continue;
++          }
++          const FixedImagePixelType  fixedImageValue = fixedRow[i];
++          const MovingImagePixelType movingImageValue = movingRow[i];
++          pFixed2[i] += fixedImageValue * fixedImageValue;
++          pMoving2[i] += movingImageValue * movingImageValue;
++          pFixed[i] += fixedImageValue;
++          pMoving[i] += movingImageValue;
++          pFixedMoving[i] += fixedImageValue * movingImageValue;
++          pCount[i] += NumericTraits<LocalRealType>::OneValue();
++        }
++      }
++    }
++
++    // Window of voxel x = xBegin + i is hyperplanes i .. i + 2*r0, summed oldest first.
++    for (unsigned int s = 0; s < NumberOfSums; ++s)
++    {
++      const LocalRealType * ANTS_CC_RESTRICT p = plane[s];
++      LocalRealType * ANTS_CC_RESTRICT       w = window[s];
++      for (SizeValueType i = 0; i < lineLength; ++i)
++      {
++        LocalRealType sum = localZero;
++        for (SizeValueType j = 0; j < windowLength; ++j)
++        {
++          sum += p[i + j];
++        }
++        w[i] = sum;
++      }
++    }
++
++    for (IndexValueType x = xBegin; x < xEnd; ++x)
++    {
++      index[0] = x;
++      const auto i = static_cast<SizeValueType>(x - xBegin);
++
++      const LocalRealType count = window[Count][i];
++      if (count <= localZero)
++      {
++        continue;
++      }
++      const LocalRealType sumFixed2 = window[Fixed2][i];
++      const LocalRealType sumMoving2 = window[Moving2][i];
++      const LocalRealType sumFixed = window[FixedSum][i];
++      const LocalRealType sumMoving = window[MovingSum][i];
++      const LocalRealType sumFixedMoving = window[FixedMoving][i];
++
++      const LocalRealType fixedMean = sumFixed / count;
++      const LocalRealType movingMean = sumMoving / count;
++
++      const LocalRealType sFixedFixed =
++        sumFixed2 - fixedMean * sumFixed - fixedMean * sumFixed + count * fixedMean * fixedMean;
++      const LocalRealType sMovingMoving =
++        sumMoving2 - movingMean * sumMoving - movingMean * sumMoving + count * movingMean * movingMean;
++      const LocalRealType sFixedMoving =
++        sumFixedMoving - movingMean * sumFixed - fixedMean * sumMoving + count * movingMean * fixedMean;
++
++      OffsetValueType linear = 0;
++      for (unsigned int d = 0; d < Dimension; ++d)
++      {
++        linear += (index[d] - bufferStart[d]) * stride[d];
++      }
++      // The centre voxel must itself pass the masks (TransformAndEvaluate*Point).
++      if ((fixedMask.buffer != nullptr && !fixedMask.Inside(linear)) ||
++          (movingMask.buffer != nullptr && !movingMask.Inside(linear)))
++      {
++        continue;
++      }
++      const FixedImagePixelType  fixedImageValue = fixedBuffer[linear];
++      const MovingImagePixelType movingImageValue = movingBuffer[linear];
++
++      VirtualPointType virtualPoint;
++      associate->TransformVirtualIndexToPhysicalPoint(index, virtualPoint);
++
++      // TransformAndEvaluateMovingPoint maps the point through the (identity) moving
++      // transform in its scalar type; reproduce that rounding for the gradient lookup.
++      MovingTransformPointType localVirtualPoint;
++      localVirtualPoint.CastFrom(virtualPoint);
++      MovingImagePointType mappedMovingPoint;
++      mappedMovingPoint.CastFrom(localVirtualPoint);
++
++      if (needMovingGradient)
++      {
++        MovingImageGradientType movingImageGradient;
++        associate->ComputeMovingImageGradientAtPoint(mappedMovingPoint, movingImageGradient);
++        scanMem.movingImageGradient = movingImageGradient;
++      }
++
++      scanMem.fixedA = fixedImageValue - fixedMean;
++      scanMem.movingA = movingImageValue - movingMean;
++      scanMem.sFixedMoving = sFixedMoving;
++      scanMem.sFixedFixed = sFixedFixed;
++      scanMem.sMovingMoving = sMovingMoving;
++      scanMem.mappedMovingPoint = mappedMovingPoint;
++      scanMem.virtualPoint = virtualPoint;
++
++      this->ComputeMovingTransformDerivative(
++        unusedScanIt, scanMem, unusedScanParameters, localDerivativeResult, metricValueResult, threadId);
++
++      this->m_GetValueAndDerivativePerThreadVariables[threadId].NumberOfValidPoints++;
++      metricValueSum -= metricValueResult;
++      if (computeDerivative)
++      {
++        this->StorePointDerivativeResult(index, threadId);
++      }
++    }
++
++    // Next line.
++    unsigned int d = 1;
++    for (; d < Dimension; ++d)
++    {
++      if (++index[d] < regionStart[d] + static_cast<IndexValueType>(regionSize[d]))
++      {
++        break;
++      }
++      index[d] = regionStart[d];
++    }
++    if (d == Dimension)
++    {
++      break;
++    }
++  }
++
++  this->m_GetValueAndDerivativePerThreadVariables[threadId].Measure = metricValueSum;
++}
++
+ /*
+  * Specific implementation for sparse threader. It reuse most of the routine from the dense threader by
+  * reinitializing the scanning at every point.
